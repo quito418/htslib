@@ -1035,6 +1035,15 @@ int bam_set1(bam1_t *bam,
              size_t l_seq, const char *seq, const char *qual,
              size_t l_aux);
 
+HTSLIB_EXPORT
+int bam_set1_bwamem(bam1_t *bam,
+             size_t l_qname, const char *qname,
+             uint16_t flag, int32_t tid, hts_pos_t pos, uint8_t mapq,
+             size_t n_cigar, const uint32_t *cigar,
+             int32_t mtid, hts_pos_t mpos, hts_pos_t isize,
+             size_t l_seq, const char *seq, const char *qual,
+             size_t l_aux);
+
 /// Calculate query length from CIGAR data
 /**
    @param n_cigar   Number of items in @p cigar
