@@ -33,6 +33,13 @@ DEALINGS IN THE SOFTWARE.  */
 #include "hts.h"
 #include "hts_endian.h"
 
+// Ensure ssize_t exists within this header. All #includes must precede this,
+// and ssize_t must be undefined again at the end of this header.
+#if defined _MSC_VER && defined _INTPTR_T_DEFINED && !defined _SSIZE_T_DEFINED && !defined ssize_t
+#define HTSLIB_SSIZE_T
+#define ssize_t intptr_t
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -937,10 +944,12 @@ void bam_destroy1(bam1_t *b);
    // ... use data ...
 
  cleanup:
-   for (size_t i = 0; i < nrecs; i++)
-     bam_destroy1(i);
+   if (recs) {
+      for (size_t i = 0; i < nrecs; i++)
+         bam_destroy1(&recs[i]);
+      free(recs);
+   }
    free(buffer);
-   free(recs);
 
    \endcode
 */
@@ -1501,7 +1510,8 @@ static inline const uint8_t *sam_format_aux1(const uint8_t *key,
         ++s;
     } else if (type == 'f') {
         if (end - s >= 4) {
-            ksprintf(ks, "f:%g", le_to_float(s));
+            // cast to avoid triggering -Wdouble-promotion
+            ksprintf(ks, "f:%g", (double)le_to_float(s));
             s += 4;
         } else goto bad_aux;
 
@@ -1523,7 +1533,7 @@ static inline const uint8_t *sam_format_aux1(const uint8_t *key,
         ++s;
     } else if (type == 'B') {
         uint8_t sub_type = *(s++);
-        int sub_type_size;
+        unsigned sub_type_size;
 
         // or externalise sam.c's aux_type2size function?
         switch (sub_type) {
@@ -1546,7 +1556,7 @@ static inline const uint8_t *sam_format_aux1(const uint8_t *key,
             goto bad_aux;
         n = le_to_u32(s);
         s += 4; // now points to the start of the array
-        if ((end - s) / sub_type_size < n)
+        if ((size_t)(end - s) / sub_type_size < n)
             goto bad_aux;
         r |= kputsn_("B:", 2, ks) < 0;
         r |= kputc(sub_type, ks) < 0; // write the type
@@ -1603,7 +1613,8 @@ static inline const uint8_t *sam_format_aux1(const uint8_t *key,
             if (ks_expand(ks, n*8) < 0) goto mem_err;
             for (i = 0; i < n; ++i) {
                 ks->s[ks->l++] = ',';
-                r |= kputd(le_to_float(s), ks) < 0;
+                // cast to avoid triggering -Wdouble-promotion
+                r |= kputd((double)le_to_float(s), ks) < 0;
                 s += 4;
             }
             break;
@@ -2271,6 +2282,11 @@ int bam_mods_at_qpos(const bam1_t *b, int qpos, hts_base_mod_state *state,
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef HTSLIB_SSIZE_T
+#undef HTSLIB_SSIZE_T
+#undef ssize_t
 #endif
 
 #endif

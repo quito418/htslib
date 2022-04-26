@@ -168,18 +168,12 @@ const char *hts_test_feature(unsigned int id) {
 // to find the configuration parameters.
 const char *hts_feature_string(void) {
     static char config[1200];
-    const char *fmt=
+    const char *flags=
 
 #ifdef PACKAGE_URL
     "build=configure "
 #else
     "build=Makefile "
-#endif
-
-#ifdef ENABLE_PLUGINS
-    "plugins=yes, plugin-path=%.1000s "
-#else
-    "plugins=no "
 #endif
 
 #ifdef HAVE_LIBCURL
@@ -218,13 +212,21 @@ const char *hts_feature_string(void) {
     "bzip2=no "
 #endif
 
-    "htscodecs=%.40s";
+// "plugins=" must stay at the end as it is followed by "plugin-path="
+#ifdef ENABLE_PLUGINS
+    "plugins=yes";
+#else
+    "plugins=no";
+#endif
 
 #ifdef ENABLE_PLUGINS
-    snprintf(config, sizeof(config), fmt,
-             hts_plugin_path(), htscodecs_version());
+    snprintf(config, sizeof(config),
+             "%s plugin-path=%.1000s htscodecs=%.40s",
+             flags, hts_plugin_path(), htscodecs_version());
 #else
-    snprintf(config, sizeof(config), fmt, htscodecs_version());
+    snprintf(config, sizeof(config),
+             "%s htscodecs=%.40s",
+             flags, htscodecs_version());
 #endif
     return config;
 }
@@ -3482,32 +3484,32 @@ static inline long long push_digit(long long i, char c)
 long long hts_parse_decimal(const char *str, char **strend, int flags)
 {
     long long n = 0;
-    int decimals = 0, e = 0, lost = 0;
+    int digits = 0, decimals = 0, e = 0, lost = 0;
     char sign = '+', esign = '+';
-    const char *s;
+    const char *s, *str_orig = str;
 
     while (isspace_c(*str)) str++;
     s = str;
 
     if (*s == '+' || *s == '-') sign = *s++;
     while (*s)
-        if (isdigit_c(*s)) n = push_digit(n, *s++);
+        if (isdigit_c(*s)) digits++, n = push_digit(n, *s++);
         else if (*s == ',' && (flags & HTS_PARSE_THOUSANDS_SEP)) s++;
         else break;
 
     if (*s == '.') {
         s++;
-        while (isdigit_c(*s)) decimals++, n = push_digit(n, *s++);
+        while (isdigit_c(*s)) decimals++, digits++, n = push_digit(n, *s++);
     }
 
-    if (*s == 'E' || *s == 'e') {
+    switch (*s) {
+    case 'e': case 'E':
         s++;
         if (*s == '+' || *s == '-') esign = *s++;
         while (isdigit_c(*s)) e = push_digit(e, *s++);
         if (esign == '-') e = -e;
-    }
+        break;
 
-    switch (*s) {
     case 'k': case 'K': e += 3; s++; break;
     case 'm': case 'M': e += 6; s++; break;
     case 'g': case 'G': e += 9; s++; break;
@@ -3522,7 +3524,10 @@ long long hts_parse_decimal(const char *str, char **strend, int flags)
     }
 
     if (strend) {
-        *strend = (char *)s;
+        // Set to the original input str pointer if not valid number syntax
+        *strend = (digits > 0)? (char *)s : (char *)str_orig;
+    } else if (digits == 0) {
+        hts_log_warning("Invalid numeric value %.8s[truncated]", str);
     } else if (*s) {
         if ((flags & HTS_PARSE_THOUSANDS_SEP) || (!(flags & HTS_PARSE_THOUSANDS_SEP) && *s != ','))
             hts_log_warning("Ignoring unknown characters after %.*s[%s]", (int)(s - str), str, s);
@@ -3708,14 +3713,17 @@ const char *hts_parse_region(const char *s, int *tid, hts_pos_t *beg,
     char *hyphen;
     *beg = hts_parse_decimal(colon+1, &hyphen, flags) - 1;
     if (*beg < 0) {
+        if (*beg != -1 && *hyphen == '-' && colon[1] != '\0') {
+            // User specified zero, but we're 1-based.
+            hts_log_error("Coordinates must be > 0");
+            return NULL;
+        }
         if (isdigit_c(*hyphen) || *hyphen == '\0' || *hyphen == ',') {
             // interpret chr:-100 as chr:1-100
             *end = *beg==-1 ? HTS_POS_MAX : -(*beg+1);
             *beg = 0;
             return s_end;
-        } else if (*hyphen == '-') {
-            *beg = 0;
-        } else {
+        } else if (*beg < -1) {
             hts_log_error("Unexpected string \"%s\" after region", hyphen);
             return NULL;
         }

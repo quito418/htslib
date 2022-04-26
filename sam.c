@@ -339,17 +339,23 @@ int bam_hdr_write(BGZF *fp, const sam_hdr_t *h)
 
     if (h->hrecs) {
         if (sam_hrecs_rebuild_text(h->hrecs, &hdr_ks) != 0) return -1;
-        if (hdr_ks.l > INT32_MAX) {
+        if (hdr_ks.l > UINT32_MAX) {
             hts_log_error("Header too long for BAM format");
             free(hdr_ks.s);
             return -1;
+        } else if (hdr_ks.l > INT32_MAX) {
+            hts_log_warning("Header too long for BAM specification (>2GB)");
+            hts_log_warning("Output file may not be portable");
         }
         text = hdr_ks.s;
         l_text = hdr_ks.l;
     } else {
-        if (h->l_text > INT32_MAX) {
+        if (h->l_text > UINT32_MAX) {
             hts_log_error("Header too long for BAM format");
             return -1;
+        } else if (h->l_text > INT32_MAX) {
+            hts_log_warning("Header too long for BAM specification (>2GB)");
+            hts_log_warning("Output file may not be portable");
         }
         text = h->text;
         l_text = h->l_text;
@@ -3054,9 +3060,10 @@ ssize_t bam_parse_cigar(const char *in, char **end, bam1_t *b) {
  * SAM threading
  */
 // Size of SAM text block (reading)
-#define NM 240000
-// Number of BAM records (writing)
-#define NB 1000
+#define SAM_NBYTES 240000
+
+// Number of BAM records (writing, up to NB_mem in size)
+#define SAM_NBAM 1000
 
 struct SAM_state;
 
@@ -3066,7 +3073,8 @@ typedef struct sp_bams {
     int serial;
 
     bam1_t *bams;
-    int nbams, abams; // used and alloc
+    int nbams, abams; // used and alloc for bams[] array
+    size_t bam_mem;   // very approximate total size
 
     struct SAM_state *fd;
 } sp_bams;
@@ -3317,6 +3325,7 @@ static void *sam_parse_worker(void *arg) {
             goto err;
         }
         gb->nbams = 0;
+        gb->bam_mem = 0;
     }
     gb->serial = gl->serial;
     gb->next = NULL;
@@ -3369,6 +3378,7 @@ static void *sam_parse_worker(void *arg) {
             cleanup_sp_lines(gl);
             goto err;
         }
+
         cp = nl;
         i++;
     }
@@ -3438,7 +3448,7 @@ static void *sam_dispatcher_read(void *vp) {
             l = calloc(1, sizeof(*l));
             if (!l)
                 goto err;
-            l->alloc = NM;
+            l->alloc = SAM_NBYTES;
             l->data = malloc(l->alloc+8); // +8 for optimisation in sam_parse1
             if (!l->data) {
                 free(l);
@@ -3449,11 +3459,11 @@ static void *sam_dispatcher_read(void *vp) {
         }
         l->next = NULL;
 
-        if (l->alloc < line_frag+NM/2) {
-            char *rp = realloc(l->data, line_frag+NM/2 +8);
+        if (l->alloc < line_frag+SAM_NBYTES/2) {
+            char *rp = realloc(l->data, line_frag+SAM_NBYTES/2 +8);
             if (!rp)
                 goto err;
-            l->alloc = line_frag+NM/2;
+            l->alloc = line_frag+SAM_NBYTES/2;
             l->data = rp;
         }
         memcpy(l->data, line.s, line_frag);
@@ -3592,6 +3602,8 @@ static void *sam_dispatcher_write(void *vp) {
                     i++;
 
                 if (fp->is_bgzf) {
+                    if (bgzf_flush_try(fp->fp.bgzf, i-j) < 0)
+                        goto err;
                     if (bgzf_write(fp->fp.bgzf, &gl->data[j], i-j) != i-j)
                         goto err;
                 } else {
@@ -3631,8 +3643,69 @@ static void *sam_dispatcher_write(void *vp) {
             pthread_mutex_unlock(&fd->lines_m);
         } else {
             if (fp->is_bgzf) {
-                if (bgzf_write(fp->fp.bgzf, gl->data, gl->data_size) != gl->data_size)
-                    goto err;
+                // We keep track of how much in the current block we have
+                // remaining => R.  We look for the last newline in input
+                // [i] to [i+R], backwards => position N.
+                //
+                // If we find a newline, we write out bytes i to N.
+                // We know we cannot fit the next record in this bgzf block,
+                // so we flush what we have and copy input N to i+R into
+                // the start of a new block, and recompute a new R for that.
+                //
+                // If we don't find a newline (i==N) then we cannot extend
+                // the current block at all, so flush whatever is in it now
+                // if it ends on a newline.
+                // We still copy i(==N) to i+R to the next block and
+                // continue as before with a new R.
+                //
+                // The only exception on the flush is when we run out of
+                // data in the input.  In that case we skip it as we don't
+                // yet know if the next record will fit.
+                //
+                // Both conditions share the same code here:
+                // - Look for newline (pos N)
+                // - Write i to N (which maybe 0)
+                // - Flush if block ends on newline and not end of input
+                // - write N to i+R
+
+                int i = 0;
+                BGZF *fb = fp->fp.bgzf;
+                while (i < gl->data_size) {
+                    // remaining space in block
+                    int R = BGZF_BLOCK_SIZE - fb->block_offset;
+                    int eod = 0;
+                    if (R > gl->data_size-i)
+                        R = gl->data_size-i, eod = 1;
+
+                    // Find last newline in input data
+                    int N = i + R;
+                    while (--N > i) {
+                        if (gl->data[N] == '\n')
+                            break;
+                    }
+
+                    if (N != i) {
+                        // Found a newline
+                        N++;
+                        if (bgzf_write(fb, &gl->data[i], N-i) != N-i)
+                            goto err;
+                    }
+
+                    // Flush bgzf block
+                    int b_off = fb->block_offset;
+                    if (!eod && b_off &&
+                        ((char *)fb->uncompressed_block)[b_off-1] == '\n')
+                        if (bgzf_flush_try(fb, BGZF_BLOCK_SIZE) < 0)
+                            goto err;
+
+                    // Copy from N onwards into next block
+                    if (i+R > N)
+                        if (bgzf_write(fb, &gl->data[N], i+R - N)
+                            != i+R - N)
+                            goto err;
+
+                    i = i+R;
+                }
             } else {
                 if (hwrite(fp->fp.hfile, gl->data, gl->data_size) != gl->data_size)
                     goto err;
@@ -4450,16 +4523,18 @@ int sam_write1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b)
                     fd->bams = gb->next;
                     gb->next = NULL;
                     gb->nbams = 0;
+                    gb->bam_mem = 0;
                     pthread_mutex_unlock(&fd->lines_m);
                 } else {
                     pthread_mutex_unlock(&fd->lines_m);
                     if (!(gb = calloc(1, sizeof(*gb)))) return -1;
-                    if (!(gb->bams = calloc(NB, sizeof(*gb->bams)))) {
+                    if (!(gb->bams = calloc(SAM_NBAM, sizeof(*gb->bams)))) {
                         free(gb);
                         return -1;
                     }
                     gb->nbams = 0;
-                    gb->abams = NB;
+                    gb->abams = SAM_NBAM;
+                    gb->bam_mem = 0;
                     gb->fd = fd;
                     fd->curr_idx = 0;
                     fd->curr_bam = gb;
@@ -4468,11 +4543,11 @@ int sam_write1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b)
 
             if (!bam_copy1(&gb->bams[gb->nbams++], b))
                 return -2;
+            gb->bam_mem += b->l_data + sizeof(*b);
 
             // Dispatch if full
-            if (gb->nbams == NB) {
+            if (gb->nbams == SAM_NBAM || gb->bam_mem > SAM_NBYTES*0.8) {
                 gb->serial = fd->serial++;
-                //fprintf(stderr, "Dispatch another %d bams\n", NB);
                 pthread_mutex_lock(&fd->command_m);
                 if (fd->errcode != 0) {
                     pthread_mutex_unlock(&fd->command_m);
@@ -4496,6 +4571,8 @@ int sam_write1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b)
             if (sam_format1(h, b, &fp->line) < 0) return -1;
             kputc('\n', &fp->line);
             if (fp->is_bgzf) {
+                if (bgzf_flush_try(fp->fp.bgzf, fp->line.l) < 0)
+                    return -1;
                 if ( bgzf_write(fp->fp.bgzf, fp->line.s, fp->line.l) != fp->line.l ) return -1;
             } else {
                 if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;
@@ -4535,6 +4612,8 @@ int sam_write1(htsFile *fp, const sam_hdr_t *h, const bam1_t *b)
         if (fastq_format1(fp->state, b, &fp->line) < 0)
             return -1;
         if (fp->is_bgzf) {
+            if (bgzf_flush_try(fp->fp.bgzf, fp->line.l) < 0)
+                return -1;
             if (bgzf_write(fp->fp.bgzf, fp->line.s, fp->line.l) != fp->line.l)
                 return -1;
         } else {
@@ -6231,7 +6310,7 @@ int bam_parse_basemod(const bam1_t *b, hts_base_mod_state *state) {
     int mod_num = 0;
     while (*cp) {
         for (; *cp; cp++) {
-            // cp should be [ACGTNU][+-][^,]*(,\d+)*;
+            // cp should be [ACGTNU][+-]([a-zA-Z]+|[0-9]+)[.?]?(,\d+)*;
             unsigned char btype = *cp++;
 
             if (btype != 'A' && btype != 'C' &&
@@ -6251,17 +6330,31 @@ int bam_parse_basemod(const bam1_t *b, hts_base_mod_state *state) {
             char *ms = cp, *me; // mod code start and end
             char *cp_end = NULL;
             int chebi = 0;
-            if (isdigit(*cp)) {
+            if (isdigit_c(*cp)) {
                 chebi = strtol(cp, &cp_end, 10);
                 cp = cp_end;
                 ms = cp-1;
             } else {
-                while (*cp && *cp != ',' && *cp != ';')
+                while (*cp && isalpha_c(*cp))
                     cp++;
                 if (*cp == '\0')
                     return -1;
             }
             me = cp;
+
+            // Optional explicit vs implicit marker.
+            // Right now we ignore this field.  A proper API for
+            // querying it will follow later.
+            if (*cp == '.') {
+                // implicit = 1;
+                cp++;
+            } else if (*cp == '?') {
+                // implicit = 0;
+                cp++;
+            } else if (*cp != ',' && *cp != ';') {
+                // parse error
+                return -1;
+            }
 
             long delta;
             int n = 0; // nth symbol in a multi-mod string
