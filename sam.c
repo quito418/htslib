@@ -622,8 +622,8 @@ int bam_set1_bwamem(bam1_t *bam,
              uint16_t flag, int32_t tid, hts_pos_t pos, uint8_t mapq,
              size_t n_cigar, const uint32_t *cigar,
              int32_t mtid, hts_pos_t mpos, hts_pos_t isize,
-             size_t l_seq, const char *seq, const char *qual,
-             size_t l_aux)
+             size_t l_seq, /*const char *seq, const char *qual,*/
+             size_t l_aux, int cigar_flag, int which)
 {
     // use a default qname "*" if none is provided
     if (l_qname == 0) {
@@ -661,17 +661,6 @@ int bam_set1_bwamem(bam1_t *bam,
         errno = EINVAL;
         return -1;
     }
-    // if (n_cigar && which && !(softclip) && !p->is_alt) {
-    //     if ((cigar[0]&0xf) == 4 || (cigar[0]&0xf) == 3) l_seq -= cigar[0]>>4;
-    //     if ((cigar[n_cigar-1]&0xf) == 4 || (cigar[n_cigar-1]&0xf) == 3) l_seq -= cigar[n_cigar-1]>>4;
-    // }
-    // if (!(flag & BAM_FUNMAP) && l_seq > 0 && l_seq != qlen) {
-    //     fprintf(stderr, "\n;%s seq:%d rlen: %d  qlen: %d\n",qname , l_seq, rlen, qlen);
-    //     hts_log_error("CIGAR and query sequence are of different length");
-        
-    //     errno = EINVAL;
-    //     return -1;
-    // }
 
     size_t limit = INT32_MAX;
     int u = subtract_check_underflow(l_qname + qname_nuls, &limit);
@@ -714,51 +703,32 @@ int bam_set1_bwamem(bam1_t *bam,
     cp += l_qname + qname_nuls;
 
 
-    fprintf(stderr, "Passed, writing bam %d\n", n_cigar);
 
     if (n_cigar > 0) {
-        memcpy(cp, cigar, n_cigar * 4);
+        
+        // memcpy(cp, cigar, n_cigar * 4);
+
+        for (i=0; i< n_cigar; i++){
+            uint32_t tmp = cigar[i];
+            int c = cigar[i]&(0xf);
+            if (cigar_flag==1 && (c == 3 || c == 4)){
+                if (which){
+                    if ( (cigar[i]&0xf) == 3){
+                        tmp = cigar[i] + 1;
+                    }
+                }else{
+                    if ( (cigar[i]&0xf) == 4){
+                        tmp = cigar[i] - 1;
+                    }
+                }
+            }    
+            if ((cigar[i]&(0xf)) >= 3) tmp++;
+            memcpy(cp+i*4, &tmp,4);
+        }
+        
     }
     cp += n_cigar * 4;
 
-    // if (flag & 0x100){
-
-    // }
-    // else if (!is_rev){
-    //     for (i = 0; i + 1 < l_seq; i += 2) {
-    //         *cp++ = ( (1 << (unsigned char)seq[i]) << 4) | ( 1 << (unsigned char)seq[i + 1] );
-    //     }
-    //     for (; i < l_seq; i++) {
-    //         *cp++ = ( 1<< (unsigned char)seq[i] ) << 4;
-    //     }
-
-    //     if (qual) {
-    //         for (i=0 ; i < l_seq; i++) {
-    //             *cp++ = qual[i] - '!';
-    //         }
-    //         // memcpy(cp, qual, l_seq);
-    //     }
-    //     else {
-    //         memset(cp, '\xff', l_seq);
-    //     }
-    // } else{
-    //     for (i = 0; i + 1 < l_seq; i += 2) {
-    //         *cp++ = ( (1 << (unsigned char)seq[i]) << 4) | ( 1 << (unsigned char)seq[i + 1] );
-    //     }
-    //     for (; i < l_seq; i++) {
-    //         *cp++ = ( 1<< (unsigned char)seq[i] ) << 4;
-    //     }
-
-    //     if (qual) {
-    //         for (i=0 ; i < l_seq; i++) {
-    //             *cp++ = qual[i] - '!';
-    //         }
-    //         // memcpy(cp, qual, l_seq);
-    //     }
-    //     else {
-    //         memset(cp, '\xff', l_seq);
-    //     }
-    // }  
     return (int)data_len;
 }
 

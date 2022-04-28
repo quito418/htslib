@@ -1,5 +1,6 @@
 {
     "files.associations": {
-        "bgzf.h": "c"
+        "bgzf.h": "c",
+        "cerrno": "c"
     }
 }

@@ -1050,8 +1050,8 @@ int bam_set1_bwamem(bam1_t *bam,
              uint16_t flag, int32_t tid, hts_pos_t pos, uint8_t mapq,
              size_t n_cigar, const uint32_t *cigar,
              int32_t mtid, hts_pos_t mpos, hts_pos_t isize,
-             size_t l_seq, const char *seq, const char *qual,
-             size_t l_aux);
+             size_t l_seq, /*const char *seq, const char *qual,*/
+             size_t l_aux, int cigar_flag, int which);
 
 /// Calculate query length from CIGAR data
 /**
